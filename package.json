@@ -1,0 +1,9 @@
+{
+  "name": "dqn-trading-dashboard",
+  "private": true,
+  "description": "Full-stack DQN trading dashboard — one command runs the website + backend monitor + AI recommendations.",
+  "scripts": {
+    "dev": "bash start.sh",
+    "start": "bash start.sh"
+  }
+}
