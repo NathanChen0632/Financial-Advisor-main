@@ -98,6 +98,25 @@ def chronological_split(
     }
 
 
+def rf_up_probability(rf_model, X: np.ndarray) -> np.ndarray:
+    # Probability the next day closes up, per the random forest. Guards the
+    # degenerate single-class case (a window where Target never varies).
+    proba = rf_model.predict_proba(X)
+    if proba.shape[1] == 1:
+        return np.full(len(X), float(rf_model.classes_[0]))
+    return proba[:, 1]
+
+
+def rf_filtered_signals(dqn_signals: np.ndarray, rf_up_prob: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    # Use the RF as a directional confirmation filter on the DQN: keep a long
+    # only when the RF also expects an up-move. The DQN and RF make different
+    # kinds of errors, so gating entries on agreement cuts false positives.
+    filtered = np.asarray(dqn_signals).copy()
+    mask     = (filtered == 1) & (np.asarray(rf_up_prob) < threshold)
+    filtered[mask] = 0
+    return filtered
+
+
 class MajorityVoteEnsemble:
     # Combines multiple classifiers by majority vote.
     # Useful for reducing variance when individual models disagree

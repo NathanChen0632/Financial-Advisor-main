@@ -809,3 +809,84 @@ class TestRegressions:
         assert trades_completed >= 1, (
             "Could not complete even one full trade cycle in the regression test"
         )
+
+
+# ===========================================================================
+# Ensemble (DQN + RF filter) and Double DQN
+# ===========================================================================
+
+class TestEnsembleAndDoubleDQN:
+    def test_rf_filter_suppresses_unconfirmed_longs(self):
+        from stock_prediction.models import rf_filtered_signals
+        sig = np.array([0, 1, 1, 0, 1])
+        up  = np.array([0.9, 0.9, 0.3, 0.9, 0.4])   # RF disagrees at idx 2 and 4
+        out = rf_filtered_signals(sig, up, threshold=0.5)
+        assert list(out) == [0, 1, 0, 0, 0]
+
+    def test_rf_filter_keeps_all_when_confirmed(self):
+        from stock_prediction.models import rf_filtered_signals
+        sig = np.array([0, 1, 1, 1])
+        up  = np.array([0.1, 0.6, 0.7, 0.8])
+        out = rf_filtered_signals(sig, up, threshold=0.5)
+        assert list(out) == [0, 1, 1, 1]
+
+    def test_run_backtest_accepts_precomputed_signals(self):
+        import pandas as pd
+        from stock_prediction.backtesting import run_backtest
+        n  = 6
+        df = pd.DataFrame({"daily_return": [0.01] * n, "atr14_pct": [0.01] * n})
+        signals = np.array([0, 1, 1, 1, 0, 0])
+        bt = run_backtest(None, df, ["atr14_pct"], signals=signals)
+        assert "exposure" in bt.columns
+        assert len(bt) == n
+        # Exposure is the volatility-based size while long, 0 while flat.
+        assert bt["exposure"].iloc[0] == 0.0
+        assert bt["exposure"].iloc[1] > 0.0
+        assert bt["exposure"].iloc[4] == 0.0
+
+    def test_double_dqn_flag_defaults_true_and_toggles(self):
+        from stock_prediction.rl_agent import DQNAgent
+        assert DQNAgent(state_size=8).double_dqn is True
+        assert DQNAgent(state_size=8, double_dqn=False).double_dqn is False
+
+    def test_double_dqn_target_uses_online_argmax(self):
+        # Craft a case where online and target nets disagree on the best next
+        # action, and verify the Bellman target uses the online-selected action
+        # valued by the target net (Double DQN), not the target's own max.
+        # Verify the Bellman target uses the ONLINE-selected next action valued
+        # by the TARGET net (Double DQN), not the target net's own max. We stub
+        # the target net with known Q values and recover the target actually used
+        # from the gradient handed to the online net's backward().
+        from stock_prediction.rl_agent import DQNAgent
+        agent = DQNAgent(state_size=2, hidden_dim=3, gamma=0.9, batch_size=1, double_dqn=True)
+
+        class _StubTarget:
+            def __init__(self, out): self._out = np.array(out, dtype=float)
+            def forward(self, x):    return np.tile(self._out, (len(x), 1))
+
+        # Target net: max is action 1 (99). Vanilla DQN would use 99; Double DQN
+        # must instead use the target value at the ONLINE net's chosen action.
+        agent.target_net = _StubTarget([2.0, 99.0])
+
+        captured = {}
+        def rec_backward(grad):          # record gradient, leave weights unchanged
+            captured["grad"] = grad.copy()
+        agent.q_net.backward = rec_backward
+
+        s      = np.zeros(2)
+        ns     = np.ones(2)
+        reward = 1.0
+        action = 0
+        agent.memory.append((s, action, reward, ns, False))
+        agent.replay()
+
+        # Weights unchanged (backward was a no-op), so recompute q_current and
+        # the online argmax over the next state.
+        q_cur    = agent.q_net.forward(s.reshape(1, -1))[0]
+        online_a = int(np.argmax(agent.q_net.forward(ns.reshape(1, -1))[0]))
+
+        # grad = 2*(q_current - q_target)/batch (batch=1) at the taken action,
+        # so q_target[action] = q_current[action] - grad/2.
+        td_used  = q_cur[action] - captured["grad"][0, action] / 2.0
+        expected = reward + agent.gamma * (2.0 if online_a == 0 else 99.0)
+        assert abs(td_used - expected) < 1e-6, (td_used, expected, online_a)

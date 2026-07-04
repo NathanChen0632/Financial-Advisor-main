@@ -338,6 +338,7 @@ class DQNAgent:
         replay_capacity:    int   = 10_000,
         target_update_freq: int   = 50,
         random_state:       int   = 42,
+        double_dqn:         bool  = True,
     ):
         np.random.seed(random_state)
         self.gamma              = gamma
@@ -346,6 +347,7 @@ class DQNAgent:
         self.epsilon_decay      = epsilon_decay
         self.batch_size         = batch_size
         self.target_update_freq = target_update_freq
+        self.double_dqn         = double_dqn
         self._step              = 0
         self.scaler             = None  # set after training; applied internally during inference
         self.q_net      = _QNetwork(state_size, hidden_dim, self.N_ACTIONS, lr)
@@ -375,13 +377,26 @@ class DQNAgent:
         next_states = np.array([b[3] for b in batch])
         dones       = np.array([b[4] for b in batch], dtype=float)
 
-        q_current = self.q_net.forward(states)
-        q_next    = self.target_net.forward(next_states)
-        q_target  = q_current.copy()
+        # Double DQN: the ONLINE net picks the next action, the TARGET net values
+        # it. Decoupling selection from evaluation removes the systematic
+        # overestimation of vanilla DQN (which takes max over the target net).
+        # NOTE: _QNetwork caches activations on forward() for backward(), so
+        # q_current must be the LAST q_net.forward() call before backward() —
+        # otherwise the online next-state pass would clobber the cached inputs.
+        q_next_online = self.q_net.forward(next_states) if self.double_dqn else None
+        q_next_target = self.target_net.forward(next_states)
+        q_current     = self.q_net.forward(states)
+        q_target      = q_current.copy()
 
-        # Bellman update: Q(s,a) = r + gamma * max Q(s') for non-terminal states
+        # Bellman update: Q(s,a) = r + gamma * Q(s', a') for non-terminal states
         for i in range(self.batch_size):
-            td = rewards[i] if dones[i] else rewards[i] + self.gamma * np.max(q_next[i])
+            if dones[i]:
+                td = rewards[i]
+            elif self.double_dqn:
+                a_star = int(np.argmax(q_next_online[i]))       # select with online
+                td     = rewards[i] + self.gamma * q_next_target[i, a_star]  # value with target
+            else:
+                td = rewards[i] + self.gamma * np.max(q_next_target[i])
             q_target[i, actions[i]] = td
 
         grad = 2.0 * (q_current - q_target) / self.batch_size

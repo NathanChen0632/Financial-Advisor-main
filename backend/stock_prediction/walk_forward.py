@@ -10,7 +10,9 @@ import matplotlib.pyplot as plt
 from stock_prediction.utils import OUTPUT_DIR, ensure_output_dir
 from stock_prediction.data_collection import download_stock_data, download_spy_context
 from stock_prediction.features import build_features, get_feature_columns
-from stock_prediction.models import fit_feature_scaler
+from stock_prediction.models import (
+    fit_feature_scaler, build_random_forest, rf_up_probability, rf_filtered_signals,
+)
 from stock_prediction.rl_agent import train_dqn_agent
 from stock_prediction.backtesting import run_backtest, compute_backtest_metrics
 from stock_prediction.benchmarks import (
@@ -80,12 +82,24 @@ def _run_window(
         prices_test    = df.loc[test_feat.index, "Close"].values.flatten()
         daily_ret      = test_feat["daily_return"].values
 
+        # Random-forest direction filter, trained once on the window's train set
+        # (seed-independent). We reuse it to gate every seed's DQN entries.
+        rf_up = None
+        try:
+            rf = build_random_forest(random_state=42)
+            rf.fit(X_train, train_feat["Target"].values)
+            rf_up = rf_up_probability(rf, test_feat[feature_cols].values)
+        except Exception as e:
+            print(f"    [{window['name']}] RF filter unavailable ({e}) — skipping ensemble.")
+
         # Train an independent agent per seed. DQN results swing a lot with the
         # initialization / exploration seed, so we report mean±std across seeds
         # rather than a single (possibly lucky) run.
         seeds         = [42 + i for i in range(max(1, n_seeds))]
         seed_metrics  = []
         seed_equities = []
+        ens_metrics   = []
+        ens_equities  = []
         bah_metrics   = None
         bah_equity    = None
 
@@ -109,16 +123,30 @@ def _run_window(
             bah_metrics = m["Buy & Hold"]              # seed-independent
             bah_equity  = bt_df["bah_equity"].values
 
+            # DQN + RF filter: keep this seed's DQN longs only when the RF agrees.
+            if rf_up is not None:
+                filt   = rf_filtered_signals(bt_df["signal"].values, rf_up, threshold=0.5)
+                ens_bt = run_backtest(None, test_feat, feature_cols, signals=filt)
+                ens_metrics.append(compute_backtest_metrics(ens_bt)["Strategy"])
+                ens_equities.append(ens_bt["strategy_equity"].values)
+
         # Aggregate strategy metrics across seeds (mean ± std).
         keys            = list(seed_metrics[0].keys())
         dqn_mean        = {k: float(np.mean([s[k] for s in seed_metrics])) for k in keys}
         dqn_std         = {k: float(np.std([s[k]  for s in seed_metrics])) for k in keys}
         dqn_equity_mean = np.mean(np.array(seed_equities), axis=0)
 
+        ens_mean = ens_std = None
+        if ens_metrics:
+            ens_mean = {k: float(np.mean([s[k] for s in ens_metrics])) for k in keys}
+            ens_std  = {k: float(np.std([s[k]  for s in ens_metrics])) for k in keys}
+
         return {
             "window":        window["name"],
             "dqn":           dqn_mean,
             "dqn_std":       dqn_std,
+            "ensemble":      ens_mean,
+            "ensemble_std":  ens_std,
             "n_seeds":       len(seeds),
             "bah":           bah_metrics,
             "ma_cross":      _metrics(ma_crossover_signals(test_feat), daily_ret),
@@ -223,6 +251,15 @@ def _print_ticker_summary(ticker: str, results: list[dict]):
     print(f"  {'Mean ± Std':<28} {np.mean(dqn_sharpes):>10.3f}±{np.std(dqn_sharpes):.3f}")
     print(f"  Beat Buy & Hold in {wins}/{len(results)} windows")
     print(f"  Avg annual return : {np.mean(dqn_returns):.1f}%  (std: {np.std(dqn_returns):.1f}%)")
+
+    # DQN + RF filter comparison, when the ensemble ran.
+    ens_results = [r for r in results if r.get("ensemble")]
+    if ens_results:
+        ens_sharpes = [r["ensemble"]["sharpe_ratio"] for r in ens_results]
+        ens_wins    = sum(1 for r in ens_results if r["ensemble"]["sharpe_ratio"] > r["dqn"]["sharpe_ratio"])
+        print(f"  {'-'*65}")
+        print(f"  DQN + RF filter Sharpe (mean): {np.mean(ens_sharpes):>7.3f}  "
+              f"(beats raw DQN in {ens_wins}/{len(ens_results)} windows)")
     print(f"  {'='*68}\n")
 
 

@@ -41,12 +41,17 @@ def run_backtest(
     transaction_cost: float = 0.001,
     slippage: float = 0.0005,
     config: TradingConfig | None = None,
+    signals: np.ndarray | None = None,
 ) -> pd.DataFrame:
     X_test = test_df[feature_cols].values
     cfg    = config or TradingConfig()
 
+    # Precomputed signals (e.g. an RF-filtered DQN sequence) bypass the model so
+    # the same sizing/cost model can score any 0/1 position series.
+    if signals is not None:
+        signals = np.asarray(signals)
     # Full disciplined simulation when prices are available (stops, R/R gating, etc.)
-    if prices is not None and hasattr(model, "_predict_with_env"):
+    elif prices is not None and hasattr(model, "_predict_with_env"):
         signals = model.predict(X_test, prices=prices, feature_cols=feature_cols)
     else:
         signals = model.predict(X_test)
