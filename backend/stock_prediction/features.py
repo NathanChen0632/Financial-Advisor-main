@@ -57,6 +57,59 @@ def _compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int 
     return adx / 100.0   # normalized to 0–1
 
 
+def triple_barrier_labels(
+    close:     pd.Series,
+    high:      pd.Series,
+    low:       pd.Series,
+    atr_pct:   pd.Series,
+    stop_mult: float = 2.0,
+    rr:        float = 2.0,
+    max_days:  int   = 10,
+) -> pd.Series:
+    """Triple-barrier label (López de Prado).
+
+    For a long entered at each bar's close, place an ATR-based stop at
+    -stop_mult*ATR and a profit target at +rr*stop_mult*ATR (a 2:1 R/R by
+    default), with a vertical time barrier at max_days. Label:
+        1  → profit target touched before the stop within the horizon
+        0  → stop touched first, or timed out below entry
+
+    This mirrors the DQN's own trade rules, so the RF/logistic models (and the
+    DQN+RF filter) learn a realistic tradeable outcome instead of noisy next-bar
+    direction. Ties within a bar resolve to the stop (conservative). Bars whose
+    ATR is unavailable get NaN (dropped downstream).
+    """
+    c = close.to_numpy(dtype=float)
+    h = high.to_numpy(dtype=float)
+    l = low.to_numpy(dtype=float)
+    a = atr_pct.to_numpy(dtype=float)
+    n = len(c)
+    out = np.full(n, np.nan)
+
+    for i in range(n):
+        ai = a[i]
+        if not np.isfinite(ai) or ai <= 0 or not np.isfinite(c[i]):
+            continue
+        entry = c[i]
+        stop  = entry * (1.0 - stop_mult * ai)
+        tgt   = entry * (1.0 + rr * stop_mult * ai)
+        end   = min(i + max_days, n - 1)
+
+        label = None
+        for j in range(i + 1, end + 1):
+            if l[j] <= stop:          # stop hit first (ties → stop, conservative)
+                label = 0
+                break
+            if h[j] >= tgt:           # target hit first
+                label = 1
+                break
+        if label is None:            # vertical barrier — label by sign of move
+            label = 1 if c[end] > entry else 0
+        out[i] = label
+
+    return pd.Series(out, index=close.index)
+
+
 def _rolling_vol_percentile(vol_series: pd.Series, window: int = 252) -> pd.Series:
     """Percentile rank of current volatility within a rolling lookback window.
     0 = historically calm, 1 = historically stressed.
@@ -223,12 +276,18 @@ def build_features(df: pd.DataFrame, spy_df: pd.DataFrame | None = None) -> pd.D
         feat["alpha_return"] = feat["daily_return"] - beta * spy_ret
 
     # ------------------------------------------------------------------
-    # Supervised target (not used by DQN; classification metrics only)
+    # Supervised target (not used by DQN; RF/logistic + DQN-RF filter).
+    # Triple-barrier label mirroring the DQN's 2:1 R/R + ATR-stop trade so the
+    # supervised models learn a realistic tradeable outcome, not next-bar noise.
     # ------------------------------------------------------------------
 
-    feat["Target"] = (close.shift(-1) > close).astype(int)
+    feat["Target"] = triple_barrier_labels(
+        close, high, low, feat["atr14_pct"],
+        stop_mult=2.0, rr=2.0, max_days=10,
+    )
 
     feat.dropna(inplace=True)
+    feat["Target"] = feat["Target"].astype(int)
     return feat
 
 

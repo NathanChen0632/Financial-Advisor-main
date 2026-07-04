@@ -890,3 +890,61 @@ class TestEnsembleAndDoubleDQN:
         td_used  = q_cur[action] - captured["grad"][0, action] / 2.0
         expected = reward + agent.gamma * (2.0 if online_a == 0 else 99.0)
         assert abs(td_used - expected) < 1e-6, (td_used, expected, online_a)
+
+
+# ===========================================================================
+# Triple-barrier labeling
+# ===========================================================================
+
+class TestTripleBarrierLabels:
+    @staticmethod
+    def _series(vals):
+        import pandas as pd
+        return pd.Series(vals, dtype=float)
+
+    def _label_first(self, o, h, l, atr, **kw):
+        # Return the label for bar 0 given full OHLC arrays.
+        from stock_prediction.features import triple_barrier_labels
+        import pandas as pd
+        c = pd.Series(o, dtype=float); hh = pd.Series(h, dtype=float)
+        ll = pd.Series(l, dtype=float); aa = pd.Series(atr, dtype=float)
+        return triple_barrier_labels(c, hh, ll, aa, **kw).iloc[0]
+
+    def test_target_hit_before_stop_labels_1(self):
+        # entry 100, atr 0.01 → stop 98, target 104. Bar1 high 104 → label 1.
+        lab = self._label_first(
+            o=[100, 102, 103], h=[100, 104, 103], l=[100, 101, 102],
+            atr=[0.01, 0.01, 0.01], max_days=2,
+        )
+        assert lab == 1
+
+    def test_stop_hit_before_target_labels_0(self):
+        # Bar1 low 97 ≤ stop 98 → label 0.
+        lab = self._label_first(
+            o=[100, 98, 99], h=[100, 101, 100], l=[100, 97, 98],
+            atr=[0.01, 0.01, 0.01], max_days=2,
+        )
+        assert lab == 0
+
+    def test_timeout_above_entry_labels_1(self):
+        # No barrier touched; final close 101 > entry 100 → label 1.
+        lab = self._label_first(
+            o=[100, 100.5, 101], h=[100, 101, 101.5], l=[100, 99.5, 100.5],
+            atr=[0.01, 0.01, 0.01], max_days=2,
+        )
+        assert lab == 1
+
+    def test_tie_resolves_to_stop(self):
+        # Bar1 hits BOTH stop (low 98) and target (high 104) → conservative 0.
+        lab = self._label_first(
+            o=[100, 100, 100], h=[100, 104, 100], l=[100, 98, 100],
+            atr=[0.01, 0.01, 0.01], max_days=2,
+        )
+        assert lab == 0
+
+    def test_missing_atr_is_nan(self):
+        from stock_prediction.features import triple_barrier_labels
+        import numpy as np, pandas as pd
+        c = pd.Series([100, 101, 102], dtype=float)
+        out = triple_barrier_labels(c, c, c, pd.Series([np.nan, 0.01, 0.01]), max_days=2)
+        assert np.isnan(out.iloc[0])
