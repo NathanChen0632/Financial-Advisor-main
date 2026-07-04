@@ -112,8 +112,7 @@ def _metrics(signals, daily_returns, initial=10_000.0) -> dict:
         "annual_return": _annual_return(eq, initial),
         "sharpe_ratio":  _sharpe(ret),
         "max_drawdown":  _max_drawdown(eq),
-        "n_trades":      int(np.diff(np.concatenate([[0], signals])) > 0).sum() if len(signals) > 1
-                         else int(np.sum(np.diff(np.concatenate([[0], signals])) > 0)),
+        "n_trades":      int((np.diff(np.concatenate([[0], signals])) > 0).sum()),
         "equity":        eq,
     }
 

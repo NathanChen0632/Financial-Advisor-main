@@ -39,6 +39,7 @@ def _run_window(
     df:          pd.DataFrame,
     spy_df:      pd.DataFrame | None,
     n_episodes:  int,
+    n_seeds:     int = 3,
 ) -> dict | None:
     try:
         train_start = window["train_start"]
@@ -76,34 +77,56 @@ def _run_window(
 
         scaler         = fit_feature_scaler(X_train)
         X_train_scaled = scaler.transform(X_train)
+        prices_test    = df.loc[test_feat.index, "Close"].values.flatten()
+        daily_ret      = test_feat["daily_return"].values
 
-        print(f"    [{window['name']}] Training {n_episodes} episodes...")
-        dqn = train_dqn_agent(
-            X_train=X_train,
-            daily_returns_train=returns_train,
-            prices_train=prices_train,
-            feature_cols=feature_cols,
-            n_episodes=n_episodes,
-            X_train_scaled=X_train_scaled,
-        )
-        dqn.scaler = scaler
+        # Train an independent agent per seed. DQN results swing a lot with the
+        # initialization / exploration seed, so we report mean±std across seeds
+        # rather than a single (possibly lucky) run.
+        seeds         = [42 + i for i in range(max(1, n_seeds))]
+        seed_metrics  = []
+        seed_equities = []
+        bah_metrics   = None
+        bah_equity    = None
 
-        prices_test = df.loc[test_feat.index, "Close"].values.flatten()
-        bt_df       = run_backtest(dqn, test_feat, feature_cols, prices=prices_test)
-        m           = compute_backtest_metrics(bt_df)
+        for seed in seeds:
+            print(f"    [{window['name']}] Training {n_episodes} episodes (seed {seed})...")
+            dqn = train_dqn_agent(
+                X_train=X_train,
+                daily_returns_train=returns_train,
+                prices_train=prices_train,
+                feature_cols=feature_cols,
+                n_episodes=n_episodes,
+                random_state=seed,
+                X_train_scaled=X_train_scaled,
+            )
+            dqn.scaler = scaler
 
-        daily_ret = test_feat["daily_return"].values
+            bt_df = run_backtest(dqn, test_feat, feature_cols, prices=prices_test)
+            m     = compute_backtest_metrics(bt_df)
+            seed_metrics.append(m["Strategy"])
+            seed_equities.append(bt_df["strategy_equity"].values)
+            bah_metrics = m["Buy & Hold"]              # seed-independent
+            bah_equity  = bt_df["bah_equity"].values
+
+        # Aggregate strategy metrics across seeds (mean ± std).
+        keys            = list(seed_metrics[0].keys())
+        dqn_mean        = {k: float(np.mean([s[k] for s in seed_metrics])) for k in keys}
+        dqn_std         = {k: float(np.std([s[k]  for s in seed_metrics])) for k in keys}
+        dqn_equity_mean = np.mean(np.array(seed_equities), axis=0)
 
         return {
             "window":        window["name"],
-            "dqn":           m["Strategy"],
-            "bah":           m["Buy & Hold"],
+            "dqn":           dqn_mean,
+            "dqn_std":       dqn_std,
+            "n_seeds":       len(seeds),
+            "bah":           bah_metrics,
             "ma_cross":      _metrics(ma_crossover_signals(test_feat), daily_ret),
             "rsi":           _metrics(rsi_signals(test_feat),           daily_ret),
             "momentum":      _metrics(momentum_signals(test_feat),      daily_ret),
             "combined":      _metrics(combined_rule_signals(test_feat), daily_ret),
-            "dqn_equity":    bt_df["strategy_equity"].values,
-            "bah_equity":    bt_df["bah_equity"].values,
+            "dqn_equity":    dqn_equity_mean,
+            "bah_equity":    bah_equity,
             "test_index":    test_feat.index,
             "n_train_days":  len(train_feat),
             "n_test_days":   len(test_feat),
@@ -118,6 +141,7 @@ def _run_window(
 def run_walk_forward(
     tickers:    list[str],
     n_episodes: int = 200,
+    n_seeds:    int = 3,
 ) -> None:
     ensure_output_dir()
     windows = _define_windows()
@@ -127,6 +151,7 @@ def run_walk_forward(
     print(f"  Tickers  : {tickers}")
     print(f"  Windows  : {len(windows)} non-overlapping test periods")
     print(f"  Episodes : {n_episodes} per window")
+    print(f"  Seeds    : {n_seeds} per window (results reported mean±std)")
     print(f"{'#'*70}\n")
 
     # Download SPY once — shared across all tickers and all windows
@@ -152,7 +177,7 @@ def run_walk_forward(
         window_results = []
         for window in windows:
             print(f"\n  Window: {window['name']}")
-            result = _run_window(ticker, window, df, spy_df, n_episodes)
+            result = _run_window(ticker, window, df, spy_df, n_episodes, n_seeds)
             if result is not None:
                 window_results.append(result)
 
@@ -172,18 +197,20 @@ def _print_ticker_summary(ticker: str, results: list[dict]):
     print(f"\n  {'='*68}")
     print(f"  Walk-Forward Results — {ticker}")
     print(f"  {'='*68}")
-    print(f"  {'Window':<28} {'DQN Sharpe':>11} {'BaH Sharpe':>11} {'DQN Ann%':>9} {'BaH Ann%':>9} {'Edge':>7}")
-    print(f"  {'-'*65}")
+    print(f"  {'Window':<28} {'DQN Sharpe':>14} {'BaH Sharpe':>10} {'DQN Ann%':>9} {'BaH Ann%':>9} {'Edge':>7}")
+    print(f"  {'-'*68}")
 
     for r in results:
-        dqn_s = r["dqn"]["sharpe_ratio"]
-        bah_s = r["bah"]["sharpe_ratio"]
-        dqn_a = r["dqn"]["annual_return"]
-        bah_a = r["bah"]["annual_return"]
-        edge  = dqn_s - bah_s
-        sign  = "+" if edge >= 0 else ""
+        dqn_s  = r["dqn"]["sharpe_ratio"]
+        dqn_sd = r.get("dqn_std", {}).get("sharpe_ratio", 0.0)
+        bah_s  = r["bah"]["sharpe_ratio"]
+        dqn_a  = r["dqn"]["annual_return"]
+        bah_a  = r["bah"]["annual_return"]
+        edge   = dqn_s - bah_s
+        sign   = "+" if edge >= 0 else ""
+        dqn_str = f"{dqn_s:.3f}±{dqn_sd:.2f}"
         print(
-            f"  {r['window']:<28} {dqn_s:>10.3f}  {bah_s:>10.3f}"
+            f"  {r['window']:<28} {dqn_str:>14} {bah_s:>10.3f}"
             f"  {dqn_a:>8.1f}%  {bah_a:>8.1f}%  {sign}{edge:>5.3f}"
         )
 

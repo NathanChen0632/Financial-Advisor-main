@@ -137,6 +137,8 @@ def parse_args():
                         help="Run walk-forward validation across 3 non-overlapping time windows.")
     parser.add_argument("--walk-forward-episodes", type=int, default=200, metavar="N",
                         help="DQN training episodes per walk-forward window (default: 200).")
+    parser.add_argument("--walk-forward-seeds", type=int, default=3, metavar="N",
+                        help="DQN seeds per walk-forward window; results reported mean±std (default: 3).")
     parser.add_argument("--broad", action="store_true",
                         help="Use the broad 30+ ticker universe instead of default tickers.")
     parser.add_argument("--research", action="store_true",
@@ -171,6 +173,7 @@ def main():
         run_walk_forward(
             tickers=tickers,
             n_episodes=args.walk_forward_episodes,
+            n_seeds=args.walk_forward_seeds,
         )
 
     if args.stress_test:

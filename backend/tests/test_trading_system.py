@@ -502,9 +502,12 @@ class TestResolveStrategyAction:
         assert action == "BUY"
         assert state.position == Position.LONG
 
-        # HOLDs — price stays between stop and target
+        # HOLDs — price stays between stop and target. Entry set days_held=0, and
+        # each LONG call increments it; the time stop fires when it reaches
+        # max_holding_days, i.e. on the max_holding_days-th call. So we hold
+        # max_holding_days - 1 times first, then the next call sells.
         hold_price = 101.0
-        for _ in range(cfg.max_holding_days - 2):
+        for _ in range(cfg.max_holding_days - 1):
             action = resolve_strategy_action(state, 1, hold_price, feats, FEATURE_COLS)
             assert action == "HOLD"
 
