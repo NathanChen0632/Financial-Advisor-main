@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -5,6 +6,30 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from stock_prediction.utils import OUTPUT_DIR, ensure_output_dir
+from stock_prediction.rl_agent import TradingConfig
+
+
+def _reconstruct_exposure(signals: np.ndarray, test_df: pd.DataFrame, cfg: TradingConfig) -> np.ndarray:
+    # Rebuild the per-day position size the DQN reward optimizes: volatility-based
+    # sizing (risk_per_trade / stop-distance) fixed at entry and held for the life
+    # of the trade, capped at cfg.max_position_size. Without this the backtest runs
+    # flat 1x exposure while the agent was trained/rewarded on sized positions, so
+    # the reported P&L wouldn't reflect what the policy actually optimizes.
+    if "atr14_pct" not in test_df.columns:
+        return signals.astype(float)   # can't size without ATR — fall back to 1x
+
+    atr      = test_df["atr14_pct"].values
+    exposure = np.zeros(len(signals), dtype=float)
+    size     = 0.0
+    for t in range(len(signals)):
+        if signals[t] == 1:
+            if t == 0 or signals[t - 1] == 0:  # entry bar — size uses ATR at entry
+                risk_frac = cfg.stop_atr_mult * atr[t]
+                size = min(cfg.risk_per_trade / risk_frac, cfg.max_position_size) if risk_frac > 0 else 1.0
+            exposure[t] = size
+        else:
+            size = 0.0
+    return exposure
 
 
 def run_backtest(
@@ -13,12 +38,14 @@ def run_backtest(
     feature_cols: list,
     initial_capital: float = 10_000.0,
     prices: np.ndarray | None = None,
+    transaction_cost: float = 0.001,
+    slippage: float = 0.0005,
+    config: TradingConfig | None = None,
 ) -> pd.DataFrame:
     X_test = test_df[feature_cols].values
+    cfg    = config or TradingConfig()
 
-    # If prices are available, run the full disciplined trading simulation
-    # stops, targets, volume checks, and R/R gating all apply.
-    # Without prices we fall back to simple signal-based returns.
+    # Full disciplined simulation when prices are available (stops, R/R gating, etc.)
     if prices is not None and hasattr(model, "_predict_with_env"):
         signals = model.predict(X_test, prices=prices, feature_cols=feature_cols)
     else:
@@ -26,18 +53,22 @@ def run_backtest(
 
     daily_ret = test_df["daily_return"].values
 
-    # Strategy return is the market return earned only on days we hold.
-    # On cash days (signal=0) the return is zero — no compounding either way.
-    strategy_ret = signals * daily_ret
+    # Exposure = volatility-based position size (matches the DQN reward), not a
+    # flat 1x signal. Turnover and cost scale with size too, so entering a 3x
+    # position incurs 3x the friction — consistent with the training objective.
+    exposure         = _reconstruct_exposure(signals, test_df, cfg)
+    position_changes = np.abs(np.diff(exposure, prepend=exposure[0] if len(exposure) else 0.0))
+    cost_per_turn    = transaction_cost + slippage   # total one-way friction
+    execution_drag   = position_changes * cost_per_turn
 
-    # Compounded equity curves show dollar growth, which is more intuitive
-    # than cumulative returns for evaluating real trading performance.
+    strategy_ret    = exposure * daily_ret - execution_drag
     strategy_equity = initial_capital * np.cumprod(1 + strategy_ret)
     bah_equity      = initial_capital * np.cumprod(1 + daily_ret)
 
     result = pd.DataFrame({
         "close_return":    daily_ret,
         "signal":          signals,
+        "exposure":        exposure,
         "strategy_return": strategy_ret,
         "bah_return":      daily_ret,
         "strategy_equity": strategy_equity,

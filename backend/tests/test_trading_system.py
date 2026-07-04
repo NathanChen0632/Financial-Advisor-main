@@ -154,6 +154,12 @@ class TestForcedExits:
         env.stop_price   = stop_price
         env.target_price = target_price
         env.days_held    = days
+        # Replicate the entry-time volatility-based sizing the env sets in step().
+        risk_frac = (env.entry_price - stop_price) / env.entry_price
+        env.position_size = (
+            min(env.cfg.risk_per_trade / risk_frac, env.cfg.max_position_size)
+            if risk_frac > 0 else 1.0
+        )
 
     # ------------------------------------------------------------------
     # Stop loss

@@ -25,18 +25,20 @@ _EnvBase: type = gym.Env if _GYM_AVAILABLE else object
 @dataclass
 class TradingConfig:
     # All trading strategy parameters in one place.
-    # Centralizing them here makes it easy to experiment with different
-    # risk tolerances without hunting through the codebase.
-    account_size:       float = 10_000.0  # starting capital ($)
-    risk_per_trade:     float = 0.01      # max 1% of account risked per trade
-    min_rr_ratio:       float = 2.0       # only enter if target is 2x the stop distance
-    max_holding_days:   int   = 10        # forced exit after N days to prevent dead money
-    stop_atr_mult:      float = 2.0       # stop placed at 2x ATR below entry
-    min_volume_ratio:   float = 0.8       # require at least 80% of average volume to confirm
-    ma_proximity_bonus: float = 0.001     # bonus for entering near MA20 (pullback setup)
-    time_decay_start:   int   = 5         # holding penalty begins after this many days
-    time_decay_rate:    float = 0.0001    # reward reduction per extra day held
-    transaction_cost:   float = 0.0005   # 0.05% per trade, applied on entry and exit
+    account_size:         float = 10_000.0  # starting capital ($)
+    risk_per_trade:       float = 0.01      # max 1% of account risked per trade
+    min_rr_ratio:         float = 2.0       # only enter if target is 2x the stop distance
+    max_holding_days:     int   = 10        # forced exit after N days to prevent dead money
+    stop_atr_mult:        float = 2.0       # stop placed at 2x ATR below entry
+    min_volume_ratio:     float = 0.8       # require at least 80% of average volume to confirm
+    ma_proximity_bonus:   float = 0.001     # bonus for entering near MA20 (pullback setup)
+    time_decay_start:     int   = 5         # holding penalty begins after this many days
+    time_decay_rate:      float = 0.0001    # reward reduction per extra day held
+    transaction_cost:     float = 0.001     # 0.10% per trade (realistic commission + spread)
+    slippage:             float = 0.0005    # 0.05% slippage per side on execution
+    max_position_size:    float = 5.0       # cap on volatility-based sizing (leverage ceiling)
+    high_vol_regime_cut:  float = 0.70      # vol_regime percentile above which regime penalty kicks in
+    vol_regime_penalty:   float = 0.003     # per-day penalty for holding in a high-vol regime
 
 
 class TradingEnv(_EnvBase):
@@ -70,11 +72,14 @@ class TradingEnv(_EnvBase):
         self.feature_cols    = feature_cols
         self.cfg             = config or TradingConfig()
 
-        # Pre-compute indices so the step function can look up ATR/volume/MA20
-        # from the feature vector without passing extra arrays around.
-        self._atr_idx  = feature_cols.index("atr14_pct")   if "atr14_pct"    in feature_cols else None
-        self._vol_idx  = feature_cols.index("volume_ratio") if "volume_ratio" in feature_cols else None
-        self._ma20_idx = feature_cols.index("ma20_ratio")   if "ma20_ratio"   in feature_cols else None
+        # Pre-compute column indices so step() can look up specific raw features
+        # (ATR for stop sizing, volume for entry confirmation, regime for reward shaping)
+        # without passing extra arrays around.
+        self._atr_idx         = feature_cols.index("atr14_pct")   if "atr14_pct"    in feature_cols else None
+        self._vol_idx         = feature_cols.index("volume_ratio") if "volume_ratio" in feature_cols else None
+        self._ma20_idx        = feature_cols.index("ma20_ratio")   if "ma20_ratio"   in feature_cols else None
+        self._vol_regime_idx  = feature_cols.index("vol_regime")   if "vol_regime"   in feature_cols else None
+        self._adx_idx         = feature_cols.index("adx14")        if "adx14"        in feature_cols else None
 
         self.n_steps    = len(feature_array)
         self.n_features = feature_array.shape[1]
@@ -99,6 +104,7 @@ class TradingEnv(_EnvBase):
         self.stop_price   = 0.0
         self.target_price = 0.0
         self.days_held    = 0
+        self.position_size = 0.0   # volatility-based size, fixed at entry
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         """Reset the episode and return (observation, info) per Gymnasium API."""
@@ -110,6 +116,7 @@ class TradingEnv(_EnvBase):
         self.stop_price   = 0.0
         self.target_price = 0.0
         self.days_held    = 0
+        self.position_size = 0.0
         return self._build_state(), {}
 
     def _build_state(self) -> np.ndarray:
@@ -148,11 +155,36 @@ class TradingEnv(_EnvBase):
         reward     = 0.0
 
 
+        # ------------------------------------------------------------------
+        # Regime context — read once per step for reward adjustments.
+        # vol_regime is a 0–1 percentile: 1.0 = historically stressed market.
+        # adx is 0–1 trend strength: low = choppy, high = trending.
+        # Both are raw (unscaled) features because the reward math uses them
+        # in their natural units.
+        # ------------------------------------------------------------------
+        vol_regime = (
+            float(self.features[self.t, self._vol_regime_idx])
+            if self._vol_regime_idx is not None else 0.5
+        )
+        adx = (
+            float(self.features[self.t, self._adx_idx])
+            if self._adx_idx is not None else 0.25
+        )
+
+        execution_cost = cfg.transaction_cost + cfg.slippage  # one-way execution friction
+
         # FLAT — agent wants to BUY
         if self.position == 0 and action == 1:
 
-            # Stop and target are set from ATR so they adapt to the stock's
-            # current volatility, tight stops in calm markets, wider in volatile ones.
+            # Refuse entry in high-vol, low-trend regimes: these are the market
+            # conditions where most false breakouts and stop-hunts occur.
+            # The 25-bonus floor on ADX (weak trend) makes the check more lenient
+            # when the model is uncertain about trend — we still allow entries but
+            # penalise harder when both conditions are unfavourable.
+            if vol_regime > cfg.high_vol_regime_cut and adx < 0.25:
+                reward -= 0.002  # extra penalty for trying to enter in bad conditions
+                # Still allow the entry — let the R/R gate reject truly bad setups
+
             atr_pct      = self.features[self.t, self._atr_idx] if self._atr_idx is not None else 0.015
             stop_dist    = cfg.stop_atr_mult * atr_pct * curr_price
             stop_price   = curr_price - stop_dist
@@ -160,18 +192,17 @@ class TradingEnv(_EnvBase):
             rr           = (target_price - curr_price) / stop_dist if stop_dist > 0 else 0.0
 
             if rr >= cfg.min_rr_ratio:
-                # Valid R/R 
-                # open the trade
                 self.position     = 1
                 self.entry_price  = curr_price
                 self.stop_price   = stop_price
                 self.target_price = target_price
                 self.days_held    = 0
-                reward           -= cfg.transaction_cost
+                # Volatility-based position size, fixed for the life of the trade.
+                # Same formula the backtest uses so training and evaluation agree.
+                risk_frac          = (self.entry_price - self.stop_price) / self.entry_price
+                self.position_size = min(cfg.risk_per_trade / risk_frac, cfg.max_position_size) if risk_frac > 0 else 1.0
+                reward            -= execution_cost * self.position_size  # sized commission + slippage on entry
 
-                # Volume confirms institutional participation.
-                # Low volume breakouts frequently fail, the agent is penalized
-                # for entering them and rewarded for waiting for strong volume.
                 if self._vol_idx is not None:
                     vol = self.features[self.t, self._vol_idx]
                     if vol < cfg.min_volume_ratio:
@@ -179,65 +210,56 @@ class TradingEnv(_EnvBase):
                     elif vol > 1.5:
                         reward += 0.0005
 
-                # Entering near MA20 indicates a pullback-to-support setup,
-                # which historically has a better risk/reward than chasing price.
                 if self._ma20_idx is not None:
                     ma20_ratio = self.features[self.t, self._ma20_idx]
                     if 0.98 <= ma20_ratio <= 1.03:
                         reward += cfg.ma_proximity_bonus
             else:
-                # R/R below minimum, penalize the agent for wanting to take a bad setup.
-                # This forces it to be selective rather than entering any upward move.
                 reward -= 0.0015
 
 
         # LONG, agent wants to SELL (voluntary exit)
         elif self.position == 1 and action == 0:
             pnl    = (curr_price - self.entry_price) / self.entry_price
-            risk_1 = self.entry_price - self.stop_price
-            size   = cfg.risk_per_trade / (risk_1 / self.entry_price) if risk_1 > 0 else 1.0
-            reward = pnl * min(size, 5.0) - cfg.transaction_cost
+            reward = (pnl - execution_cost) * self.position_size
             self._reset_position()
 
 
         # LONG, agent wants to HOLD
         elif self.position == 1 and action == 1:
             self.days_held += 1
-            risk_1 = self.entry_price - self.stop_price
-            size   = cfg.risk_per_trade / (risk_1 / self.entry_price) if risk_1 > 0 else 1.0
+            size = self.position_size
 
             if next_price <= self.stop_price:
-                # Stop loss hit — loss is capped at risk_per_trade by construction.
-                # The extra -0.002 penalty reinforces that letting stops hit is bad.
                 pnl    = (self.stop_price - self.entry_price) / self.entry_price
-                reward = pnl * min(size, 5.0) - cfg.transaction_cost - 0.002
+                reward = (pnl - execution_cost) * size - 0.002
                 self._reset_position()
 
             elif next_price >= self.target_price:
-                # Target hit — reward scaled up to encourage holding winners to target
-                # rather than taking profits too early out of fear.
                 pnl    = (self.target_price - self.entry_price) / self.entry_price
-                reward = pnl * min(size, 5.0) - cfg.transaction_cost + 0.002
+                reward = (pnl - execution_cost) * size + 0.002
                 self._reset_position()
 
             elif self.days_held >= cfg.max_holding_days:
-                # Time stop — exits positions that haven't resolved.
-                # Prevents the agent from holding losing trades indefinitely.
                 pnl    = (curr_price - self.entry_price) / self.entry_price
-                reward = pnl * min(size, 5.0) - cfg.transaction_cost - 0.001
+                reward = (pnl - execution_cost) * size - 0.001
                 self._reset_position()
 
             else:
-                # Normal hold day — reward tracks actual daily P&L.
-                # Time decay kicks in after a few days to discourage overstaying.
-                reward = daily_ret * min(size, 5.0)
+                # Normal hold — risk-adjusted daily return.
+                # A positive return in a high-vol regime is less impressive than
+                # the same return in a calm regime (the Sharpe is lower), so we
+                # apply a regime penalty that grows with vol stress.  This teaches
+                # the agent to prefer holding through calm, trending conditions.
+                reward = daily_ret * size
                 if self.days_held > cfg.time_decay_start:
                     reward -= cfg.time_decay_rate * (self.days_held - cfg.time_decay_start)
+                # Regime penalty: discourages sitting through high-vol, choppy periods
+                if vol_regime > cfg.high_vol_regime_cut:
+                    severity = (vol_regime - cfg.high_vol_regime_cut) / (1.0 - cfg.high_vol_regime_cut)
+                    reward  -= cfg.vol_regime_penalty * severity
 
-        # FLAT — agent stays in cash
-        # Small opportunity cost when the stock rises while we sit out.
-        # Without this, the agent learns that cash is always "safe" and
-        # defaults to 0 actions, this nudges it to participate in uptrends.
+        # FLAT — opportunity cost nudge (unchanged)
         else:
             if daily_ret > 0:
                 reward = -0.0003 * daily_ret
@@ -253,6 +275,7 @@ class TradingEnv(_EnvBase):
         self.stop_price   = 0.0
         self.target_price = 0.0
         self.days_held    = 0
+        self.position_size = 0.0
 
 
 class _QNetwork:
